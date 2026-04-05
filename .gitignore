@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test/cache tools
+.pytest_cache/
+.mypy_cache/
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Sensitive PKI material
+pki/
+*.pem
+*.key
+*.crt
+ca.pass
+secrets/
+
+# Local temp files
+*.tmp
+*.bak
