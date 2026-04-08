@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, ExtensionOID
 
 
 DN_MAP = {
@@ -16,6 +16,7 @@ DN_MAP = {
     "L": NameOID.LOCALITY_NAME,
     "ST": NameOID.STATE_OR_PROVINCE_NAME,
     "EMAILADDRESS": NameOID.EMAIL_ADDRESS,
+    "EMAIL": NameOID.EMAIL_ADDRESS,
 }
 
 
@@ -55,6 +56,14 @@ def parse_subject_dn(dn_string: str) -> x509.Name:
     return x509.Name(attrs)
 
 
+def choose_hash_for_signing(private_key):
+    if hasattr(private_key, "curve"):
+        if private_key.curve.name == "secp384r1":
+            return hashes.SHA384()
+        return hashes.SHA256()
+    return hashes.SHA256()
+
+
 def build_self_signed_root_ca(private_key, subject_dn: str, validity_days: int):
     subject = parse_subject_dn(subject_dn)
     now = datetime.now(timezone.utc)
@@ -89,23 +98,112 @@ def build_self_signed_root_ca(private_key, subject_dn: str, validity_days: int):
             x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
             critical=False,
         )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(private_key.public_key()),
+            critical=False,
+        )
     )
 
-    ski = x509.SubjectKeyIdentifier.from_public_key(private_key.public_key())
-    builder = builder.add_extension(
-        x509.AuthorityKeyIdentifier.from_issuer_public_key(private_key.public_key()),
-        critical=False,
+    return builder.sign(private_key=private_key, algorithm=choose_hash_for_signing(private_key))
+
+
+def build_intermediate_certificate(root_cert, root_key, csr, validity_days: int, pathlen: int):
+    now = datetime.now(timezone.utc)
+
+    root_ski = root_cert.extensions.get_extension_for_oid(
+        ExtensionOID.SUBJECT_KEY_IDENTIFIER
+    ).value.digest
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(root_cert.subject)
+        .public_key(csr.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=validity_days))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=pathlen),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=False,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(csr.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier(
+                key_identifier=root_ski,
+                authority_cert_issuer=None,
+                authority_cert_serial_number=None,
+            ),
+            critical=False,
+        )
     )
 
-    if private_key.__class__.__name__.lower().startswith("_ec") or "ec" in private_key.__class__.__name__.lower():
-        algorithm = hashes.SHA384()
-    else:
-        algorithm = hashes.SHA256()
+    return builder.sign(private_key=root_key, algorithm=choose_hash_for_signing(root_key))
 
-    cert = builder.sign(private_key=private_key, algorithm=algorithm)
 
-    return cert
+def build_end_entity_certificate(
+    issuer_cert,
+    issuer_key,
+    subject_dn: str,
+    subject_public_key,
+    validity_days: int,
+    template_builder,
+):
+    now = datetime.now(timezone.utc)
+
+    issuer_ski = issuer_cert.extensions.get_extension_for_oid(
+        ExtensionOID.SUBJECT_KEY_IDENTIFIER
+    ).value.digest
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(parse_subject_dn(subject_dn))
+        .issuer_name(issuer_cert.subject)
+        .public_key(subject_public_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=validity_days))
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(subject_public_key),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier(
+                key_identifier=issuer_ski,
+                authority_cert_issuer=None,
+                authority_cert_serial_number=None,
+            ),
+            critical=False,
+        )
+    )
+
+    builder = template_builder(builder)
+
+    return builder.sign(private_key=issuer_key, algorithm=choose_hash_for_signing(issuer_key))
 
 
 def serialize_certificate(cert) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def certificate_common_name(cert: x509.Certificate) -> str:
+    for attr in cert.subject:
+        if attr.oid == NameOID.COMMON_NAME:
+            return attr.value
+    return f"cert-{cert.serial_number:x}"
