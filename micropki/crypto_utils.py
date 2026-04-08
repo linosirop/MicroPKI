@@ -40,14 +40,19 @@ def serialize_encrypted_private_key(private_key, passphrase: bytes) -> bytes:
     )
 
 
-def save_private_key(path: Path, pem_data: bytes) -> None:
+def load_encrypted_private_key(pem_data: bytes, passphrase: bytes):
+    return serialization.load_pem_private_key(pem_data, password=passphrase)
+
+
+def save_private_key(path: Path, pem_data: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(pem_data)
 
     try:
         path.chmod(0o600)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def save_certificate(path: Path, pem_data: bytes) -> None:

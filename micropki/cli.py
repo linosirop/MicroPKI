@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,13 @@ def validate_args(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     if out_dir.exists() and not out_dir.is_dir():
         raise ValueError("--out-dir exists but is not a directory")
+
+    parent_dir = out_dir if out_dir.exists() else out_dir.parent
+    if not parent_dir.exists():
+        parent_dir = Path(".")
+
+    if not os.access(parent_dir, os.W_OK):
+        raise ValueError("--out-dir is not writable")
 
 
 def build_parser() -> argparse.ArgumentParser:

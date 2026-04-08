@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -13,15 +14,18 @@ from micropki.crypto_utils import (
 from micropki.certificates import build_self_signed_root_ca, serialize_certificate
 
 
-def ensure_output_directory(out_dir: Path) -> None:
+def ensure_output_directory(out_dir: Path, logger) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "private").mkdir(parents=True, exist_ok=True)
-    (out_dir / "certs").mkdir(parents=True, exist_ok=True)
+    private_dir = out_dir / "private"
+    certs_dir = out_dir / "certs"
+
+    private_dir.mkdir(parents=True, exist_ok=True)
+    certs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        (out_dir / "private").chmod(0o700)
+        private_dir.chmod(0o700)
     except Exception:
-        pass
+        logger.warning("Could not enforce 0o700 permissions on private directory on this OS.")
 
 
 def write_policy_file(
@@ -56,7 +60,7 @@ def init_root_ca(
     logger,
 ) -> None:
     out_path = Path(out_dir)
-    ensure_output_directory(out_path)
+    ensure_output_directory(out_path, logger)
 
     key_path = out_path / "private" / "ca.key.pem"
     cert_path = out_path / "certs" / "ca.cert.pem"
@@ -79,8 +83,10 @@ def init_root_ca(
     encrypted_key = serialize_encrypted_private_key(private_key, passphrase)
     cert_pem = serialize_certificate(cert)
 
-    save_private_key(key_path, encrypted_key)
+    permissions_ok = save_private_key(key_path, encrypted_key)
     logger.info(f"Saved private key to {key_path.resolve()}")
+    if not permissions_ok:
+        logger.warning("Could not enforce 0o600 permissions on private key file on this OS.")
 
     save_certificate(cert_path, cert_pem)
     logger.info(f"Saved certificate to {cert_path.resolve()}")
