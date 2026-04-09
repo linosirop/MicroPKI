@@ -11,11 +11,14 @@ from micropki.ca import (
     issue_end_entity_certificate,
     show_certificate_from_db,
     list_certificates_from_db,
+    revoke_certificate_via_cli,
+    generate_crl_via_cli,
 )
 from micropki.logger import setup_logger
 from micropki.certificates import parse_subject_dn
 from micropki.database import init_database
 from micropki.repository import serve_repository
+from micropki.revocation import SUPPORTED_REVOCATION_REASONS
 
 
 DEFAULT_DB_PATH = "./pki/micropki.db"
@@ -95,6 +98,21 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.format not in {"table", "json", "csv"}:
             raise ValueError("--format must be one of: table, json, csv")
 
+    elif args.ca_command == "revoke":
+        if not args.serial:
+            raise ValueError("Serial must be provided")
+        if args.reason.strip().lower() not in SUPPORTED_REVOCATION_REASONS:
+            raise ValueError(f"Unsupported revocation reason: {args.reason}")
+
+    elif args.ca_command == "gen-crl":
+        if args.ca not in {"root", "intermediate"}:
+            raise ValueError("--ca must be either 'root' or 'intermediate'")
+        if args.next_update <= 0:
+            raise ValueError("--next-update must be positive")
+        if not Path(args.passphrase_file).is_file():
+            raise ValueError("--passphrase-file must exist and be readable")
+        validate_writable_directory(args.out_dir)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="micropki")
@@ -164,6 +182,22 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--format", default="table", type=str)
     list_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     list_parser.add_argument("--log-file", default=None, type=str)
+
+    revoke_parser = ca_subparsers.add_parser("revoke")
+    revoke_parser.add_argument("serial", type=str)
+    revoke_parser.add_argument("--reason", default="unspecified", type=str)
+    revoke_parser.add_argument("--force", action="store_true")
+    revoke_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    revoke_parser.add_argument("--log-file", default=None, type=str)
+
+    gen_crl_parser = ca_subparsers.add_parser("gen-crl")
+    gen_crl_parser.add_argument("--ca", required=True, type=str)
+    gen_crl_parser.add_argument("--next-update", default=7, type=int)
+    gen_crl_parser.add_argument("--out-dir", default="./pki", type=str)
+    gen_crl_parser.add_argument("--out-file", default=None, type=str)
+    gen_crl_parser.add_argument("--passphrase-file", required=True, type=str)
+    gen_crl_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    gen_crl_parser.add_argument("--log-file", default=None, type=str)
 
     return parser
 
@@ -258,6 +292,32 @@ def main() -> None:
                 output_format=args.format,
             )
             print(output)
+            return
+
+        if args.command == "ca" and args.ca_command == "revoke":
+            result = revoke_certificate_via_cli(
+                db_path=args.db_path,
+                serial_hex=args.serial,
+                reason=args.reason,
+                logger=logger,
+            )
+            if result["already_revoked"]:
+                print(f"Certificate {result['serial_hex']} is already revoked.")
+            else:
+                print(f"Certificate {result['serial_hex']} revoked successfully.")
+            return
+
+        if args.command == "ca" and args.ca_command == "gen-crl":
+            result = generate_crl_via_cli(
+                db_path=args.db_path,
+                out_dir=args.out_dir,
+                ca=args.ca,
+                passphrase_file=args.passphrase_file,
+                next_update_days=args.next_update,
+                logger=logger,
+                out_file=args.out_file,
+            )
+            print(f"CRL generated successfully: {result['output_path']}")
             return
 
         parser.print_help()

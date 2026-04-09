@@ -1,0 +1,21 @@
+MicroPKI Root CA Policy
+Policy Version: 1.0
+Creation Date: 2026-04-09T05:31:44.660484+00:00
+
+CA Name: CN=Demo Root CA,O=MicroPKI,C=US
+Certificate Serial Number: 69d739c0169f2182
+Validity NotBefore: 2026-04-09T05:31:44+00:00
+Validity NotAfter: 2036-04-06T05:31:44+00:00
+Key Algorithm and Size: RSA-4096
+Purpose: Root CA for MicroPKI demonstration
+
+
+Intermediate CA Section
+Creation Date: 2026-04-09T05:31:45.664141+00:00
+Subject DN: CN=MicroPKI Intermediate CA,O=MicroPKI,C=US
+Serial Number: 69d739c1a6b1eac5
+Validity NotBefore: 2026-04-09T05:31:45+00:00
+Validity NotAfter: 2031-04-08T05:31:45+00:00
+Key Algorithm and Size: RSA-4096
+Path Length Constraint: 0
+Issuer DN: C=US,O=MicroPKI,CN=Demo Root CA

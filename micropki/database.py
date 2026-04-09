@@ -25,6 +25,18 @@ ON certificates(serial_hex);
 
 CREATE INDEX IF NOT EXISTS idx_certificates_status
 ON certificates(status);
+
+CREATE TABLE IF NOT EXISTS crl_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ca_subject TEXT NOT NULL,
+    crl_number INTEGER NOT NULL,
+    last_generated TEXT NOT NULL,
+    next_update TEXT NOT NULL,
+    crl_path TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_subject
+ON crl_metadata(ca_subject);
 """
 
 

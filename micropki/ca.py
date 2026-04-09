@@ -29,11 +29,13 @@ from micropki.database import (
     get_certificate_by_serial,
     list_certificates,
 )
+from micropki.revocation import revoke_certificate
+from micropki.crl import build_crl_for_ca
 
 
 def ensure_output_directory(out_dir: Path, logger) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for subdir in ("private", "certs", "csrs"):
+    for subdir in ("private", "certs", "csrs", "crl"):
         path = out_dir / subdir
         path.mkdir(parents=True, exist_ok=True)
         if subdir == "private":
@@ -326,3 +328,28 @@ def list_certificates_from_db(
 
     logger.info(f"Listed certificates from DB: count={len(data_rows)}, status_filter={status}")
     return "\n".join(lines)
+
+
+def revoke_certificate_via_cli(db_path: str, serial_hex: str, reason: str, logger):
+    return revoke_certificate(db_path, serial_hex, reason, logger)
+
+
+def generate_crl_via_cli(
+    db_path: str,
+    out_dir: str,
+    ca: str,
+    passphrase_file: str,
+    next_update_days: int,
+    logger,
+    out_file: str | None = None,
+):
+    logger.info(f"Starting CRL generation for CA={ca}")
+    return build_crl_for_ca(
+        db_path=db_path,
+        out_dir=out_dir,
+        ca=ca,
+        passphrase_file=passphrase_file,
+        next_update_days=next_update_days,
+        logger=logger,
+        out_file=out_file,
+    )
