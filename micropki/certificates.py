@@ -7,6 +7,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID, ExtensionOID
 
+from micropki.serial import generate_unique_serial_int
+
 
 DN_MAP = {
     "CN": NameOID.COMMON_NAME,
@@ -73,7 +75,7 @@ def build_self_signed_root_ca(private_key, subject_dn: str, validity_days: int):
         .subject_name(subject)
         .issuer_name(subject)
         .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
+        .serial_number(generate_unique_serial_int())
         .not_valid_before(now)
         .not_valid_after(now + timedelta(days=validity_days))
         .add_extension(
@@ -119,7 +121,7 @@ def build_intermediate_certificate(root_cert, root_key, csr, validity_days: int,
         .subject_name(csr.subject)
         .issuer_name(root_cert.subject)
         .public_key(csr.public_key())
-        .serial_number(x509.random_serial_number())
+        .serial_number(generate_unique_serial_int())
         .not_valid_before(now)
         .not_valid_after(now + timedelta(days=validity_days))
         .add_extension(
@@ -176,7 +178,7 @@ def build_end_entity_certificate(
         .subject_name(parse_subject_dn(subject_dn))
         .issuer_name(issuer_cert.subject)
         .public_key(subject_public_key)
-        .serial_number(x509.random_serial_number())
+        .serial_number(generate_unique_serial_int())
         .not_valid_before(now)
         .not_valid_after(now + timedelta(days=validity_days))
         .add_extension(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -23,6 +24,11 @@ from micropki.certificates import (
 )
 from micropki.csr import build_intermediate_csr, serialize_csr
 from micropki.templates import parse_san_entries, validate_template_and_sans, apply_end_entity_template
+from micropki.database import (
+    insert_certificate_record,
+    get_certificate_by_serial,
+    list_certificates,
+)
 
 
 def ensure_output_directory(out_dir: Path, logger) -> None:
@@ -85,7 +91,25 @@ Issuer DN: {issuer_dn}
         f.write(content)
 
 
-def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days, logger) -> None:
+def _store_certificate_in_db(cert, cert_pem: str, db_path: str, logger, subject_override: str | None = None) -> None:
+    serial_hex = f"{cert.serial_number:x}".upper()
+    subject = subject_override or cert.subject.rfc4514_string()
+    issuer = cert.issuer.rfc4514_string()
+
+    insert_certificate_record(
+        db_path=db_path,
+        serial_hex=serial_hex,
+        subject=subject,
+        issuer=issuer,
+        not_before=cert.not_valid_before_utc.isoformat(),
+        not_after=cert.not_valid_after_utc.isoformat(),
+        cert_pem=cert_pem,
+        status="valid",
+    )
+    logger.info(f"Inserted certificate into DB: serial={serial_hex}, subject={subject}")
+
+
+def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days, logger, db_path: str | None = None) -> None:
     out_path = Path(out_dir)
     ensure_output_directory(out_path, logger)
 
@@ -105,13 +129,18 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity
     cert = build_self_signed_root_ca(private_key, subject, validity_days)
     logger.info("Certificate signing completed successfully")
 
+    cert_pem = serialize_certificate(cert).decode("utf-8")
+
     permissions_ok = save_private_key(key_path, serialize_encrypted_private_key(private_key, passphrase))
     logger.info(f"Saved private key to {key_path.resolve()}")
     if not permissions_ok:
         logger.warning("Could not enforce 0o600 permissions on private key file on this OS.")
 
-    save_certificate(cert_path, serialize_certificate(cert))
+    save_certificate(cert_path, cert_pem.encode("utf-8"))
     logger.info(f"Saved certificate to {cert_path.resolve()}")
+
+    if db_path:
+        _store_certificate_in_db(cert, cert_pem, db_path, logger, subject)
 
     write_policy_file(out_path, subject, cert, key_type, key_size)
     logger.info(f"Generated policy file at {(out_path / 'policy.txt').resolve()}")
@@ -129,6 +158,7 @@ def issue_intermediate_ca(
     validity_days: int,
     pathlen: int,
     logger,
+    db_path: str | None = None,
 ) -> None:
     out_path = Path(out_dir)
     ensure_output_directory(out_path, logger)
@@ -164,6 +194,11 @@ def issue_intermediate_ca(
         pathlen=pathlen,
     )
 
+    intermediate_pem = serialize_certificate(intermediate_cert).decode("utf-8")
+
+    if db_path:
+        _store_certificate_in_db(intermediate_cert, intermediate_pem, db_path, logger, subject)
+
     permissions_ok = save_private_key(
         intermediate_key_path,
         serialize_encrypted_private_key(intermediate_key, intermediate_passphrase),
@@ -172,7 +207,7 @@ def issue_intermediate_ca(
     if not permissions_ok:
         logger.warning("Could not enforce 0o600 permissions on private key file on this OS.")
 
-    save_certificate(intermediate_cert_path, serialize_certificate(intermediate_cert))
+    save_certificate(intermediate_cert_path, intermediate_pem.encode("utf-8"))
     logger.info(f"Saved certificate to {intermediate_cert_path.resolve()}")
 
     append_intermediate_policy(
@@ -197,6 +232,7 @@ def issue_end_entity_certificate(
     out_dir: str,
     validity_days: int,
     logger,
+    db_path: str | None = None,
 ) -> None:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -224,6 +260,11 @@ def issue_end_entity_certificate(
         template_builder=template_builder,
     )
 
+    cert_pem = serialize_certificate(cert).decode("utf-8")
+
+    if db_path:
+        _store_certificate_in_db(cert, cert_pem, db_path, logger, subject)
+
     common_name = certificate_common_name(cert).replace(" ", "_")
     cert_path = out_path / f"{common_name}.cert.pem"
     key_path = out_path / f"{common_name}.key.pem"
@@ -233,7 +274,7 @@ def issue_end_entity_certificate(
     if not permissions_ok:
         logger.warning("Could not enforce 0o600 permissions on end-entity private key file on this OS.")
 
-    save_certificate(cert_path, serialize_certificate(cert))
+    save_certificate(cert_path, cert_pem.encode("utf-8"))
 
     logger.info(
         f"Successful issuance of end-entity certificate: template={template}, "
@@ -241,3 +282,47 @@ def issue_end_entity_certificate(
     )
     logger.info(f"Saved end-entity key to {key_path.resolve()}")
     logger.info(f"Saved end-entity certificate to {cert_path.resolve()}")
+
+
+def show_certificate_from_db(db_path: str, serial_hex: str, logger) -> str:
+    row = get_certificate_by_serial(db_path, serial_hex)
+    if row is None:
+        raise ValueError(f"Certificate with serial {serial_hex} not found")
+
+    logger.info(f"Retrieved certificate via show-cert: serial={serial_hex}")
+    return row["cert_pem"]
+
+
+def list_certificates_from_db(
+    db_path: str,
+    logger,
+    status: str | None = None,
+    output_format: str = "table",
+) -> str:
+    rows = list_certificates(db_path, status=status)
+
+    if output_format == "json":
+        return json.dumps([dict(row) for row in rows], indent=2, ensure_ascii=False)
+
+    if output_format == "csv":
+        lines = ["serial_hex,subject,not_after,status"]
+        for row in rows:
+            lines.append(f'{row["serial_hex"]},"{row["subject"]}",{row["not_after"]},{row["status"]}')
+        return "\n".join(lines)
+
+    headers = ("SERIAL", "SUBJECT", "EXPIRES", "STATUS")
+    data_rows = [(r["serial_hex"], r["subject"], r["not_after"], r["status"]) for r in rows]
+
+    widths = [len(h) for h in headers]
+    for row in data_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    def fmt_row(values):
+        return " | ".join(str(v).ljust(widths[i]) for i, v in enumerate(values))
+
+    lines = [fmt_row(headers), "-+-".join("-" * w for w in widths)]
+    lines.extend(fmt_row(r) for r in data_rows)
+
+    logger.info(f"Listed certificates from DB: count={len(data_rows)}, status_filter={status}")
+    return "\n".join(lines)

@@ -5,9 +5,20 @@ import os
 import sys
 from pathlib import Path
 
-from micropki.ca import init_root_ca, issue_intermediate_ca, issue_end_entity_certificate
+from micropki.ca import (
+    init_root_ca,
+    issue_intermediate_ca,
+    issue_end_entity_certificate,
+    show_certificate_from_db,
+    list_certificates_from_db,
+)
 from micropki.logger import setup_logger
 from micropki.certificates import parse_subject_dn
+from micropki.database import init_database
+from micropki.repository import serve_repository
+
+
+DEFAULT_DB_PATH = "./pki/micropki.db"
 
 
 def validate_writable_directory(path_str: str) -> None:
@@ -20,6 +31,18 @@ def validate_writable_directory(path_str: str) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.command == "db":
+        if args.db_command == "init":
+            validate_writable_directory(args.db_path)
+        return
+
+    if args.command == "repo":
+        if args.repo_command == "serve":
+            validate_writable_directory(args.db_path)
+            if args.port <= 0 or args.port > 65535:
+                raise ValueError("--port must be between 1 and 65535")
+        return
+
     if args.command != "ca":
         return
 
@@ -62,10 +85,35 @@ def validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(f"Missing required file: {file_arg}")
         validate_writable_directory(args.out_dir)
 
+    elif args.ca_command == "show-cert":
+        if not args.serial:
+            raise ValueError("Serial must be provided")
+
+    elif args.ca_command == "list-certs":
+        if args.status and args.status not in {"valid", "revoked", "expired"}:
+            raise ValueError("--status must be one of: valid, revoked, expired")
+        if args.format not in {"table", "json", "csv"}:
+            raise ValueError("--format must be one of: table, json, csv")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="micropki")
     subparsers = parser.add_subparsers(dest="command")
+
+    db_parser = subparsers.add_parser("db")
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+    db_init_parser = db_subparsers.add_parser("init")
+    db_init_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    db_init_parser.add_argument("--log-file", default=None, type=str)
+
+    repo_parser = subparsers.add_parser("repo")
+    repo_subparsers = repo_parser.add_subparsers(dest="repo_command")
+    repo_serve_parser = repo_subparsers.add_parser("serve")
+    repo_serve_parser.add_argument("--host", default="127.0.0.1", type=str)
+    repo_serve_parser.add_argument("--port", default=8080, type=int)
+    repo_serve_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    repo_serve_parser.add_argument("--cert-dir", default="./pki/certs", type=str)
+    repo_serve_parser.add_argument("--log-file", default=None, type=str)
 
     ca_parser = subparsers.add_parser("ca")
     ca_subparsers = ca_parser.add_subparsers(dest="ca_command")
@@ -77,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--passphrase-file", required=True, type=str)
     init_parser.add_argument("--out-dir", default="./pki", type=str)
     init_parser.add_argument("--validity-days", default=3650, type=int)
+    init_parser.add_argument("--db-path", default=None, type=str)
     init_parser.add_argument("--log-file", default=None, type=str)
 
     intermediate_parser = ca_subparsers.add_parser("issue-intermediate")
@@ -90,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     intermediate_parser.add_argument("--out-dir", default="./pki", type=str)
     intermediate_parser.add_argument("--validity-days", default=1825, type=int)
     intermediate_parser.add_argument("--pathlen", default=0, type=int)
+    intermediate_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     intermediate_parser.add_argument("--log-file", default=None, type=str)
 
     cert_parser = ca_subparsers.add_parser("issue-cert")
@@ -101,7 +151,19 @@ def build_parser() -> argparse.ArgumentParser:
     cert_parser.add_argument("--san", action="append")
     cert_parser.add_argument("--out-dir", default="./pki/certs", type=str)
     cert_parser.add_argument("--validity-days", default=365, type=int)
+    cert_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     cert_parser.add_argument("--log-file", default=None, type=str)
+
+    show_parser = ca_subparsers.add_parser("show-cert")
+    show_parser.add_argument("serial", type=str)
+    show_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    show_parser.add_argument("--log-file", default=None, type=str)
+
+    list_parser = ca_subparsers.add_parser("list-certs")
+    list_parser.add_argument("--status", default=None, type=str)
+    list_parser.add_argument("--format", default="table", type=str)
+    list_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    list_parser.add_argument("--log-file", default=None, type=str)
 
     return parser
 
@@ -110,7 +172,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command != "ca" or not args.ca_command:
+    if not args.command:
         parser.print_help()
         sys.exit(1)
 
@@ -119,7 +181,23 @@ def main() -> None:
     try:
         validate_args(args)
 
-        if args.ca_command == "init":
+        if args.command == "db" and args.db_command == "init":
+            init_database(args.db_path)
+            logger.info(f"Database initialised successfully at {Path(args.db_path).resolve()}")
+            print("Database initialized successfully.")
+            return
+
+        if args.command == "repo" and args.repo_command == "serve":
+            serve_repository(
+                host=args.host,
+                port=args.port,
+                db_path=args.db_path,
+                cert_dir=args.cert_dir,
+                logger=logger,
+            )
+            return
+
+        if args.command == "ca" and args.ca_command == "init":
             init_root_ca(
                 subject=args.subject,
                 key_type=args.key_type,
@@ -128,10 +206,12 @@ def main() -> None:
                 out_dir=args.out_dir,
                 validity_days=args.validity_days,
                 logger=logger,
+                db_path=args.db_path,
             )
             print("Root CA initialized successfully.")
+            return
 
-        elif args.ca_command == "issue-intermediate":
+        if args.command == "ca" and args.ca_command == "issue-intermediate":
             issue_intermediate_ca(
                 root_cert_path=args.root_cert,
                 root_key_path=args.root_key,
@@ -144,10 +224,12 @@ def main() -> None:
                 validity_days=args.validity_days,
                 pathlen=args.pathlen,
                 logger=logger,
+                db_path=args.db_path,
             )
             print("Intermediate CA issued successfully.")
+            return
 
-        elif args.ca_command == "issue-cert":
+        if args.command == "ca" and args.ca_command == "issue-cert":
             issue_end_entity_certificate(
                 ca_cert_path=args.ca_cert,
                 ca_key_path=args.ca_key,
@@ -158,8 +240,28 @@ def main() -> None:
                 out_dir=args.out_dir,
                 validity_days=args.validity_days,
                 logger=logger,
+                db_path=args.db_path,
             )
             print("End-entity certificate issued successfully.")
+            return
+
+        if args.command == "ca" and args.ca_command == "show-cert":
+            pem = show_certificate_from_db(args.db_path, args.serial, logger)
+            print(pem, end="")
+            return
+
+        if args.command == "ca" and args.ca_command == "list-certs":
+            output = list_certificates_from_db(
+                db_path=args.db_path,
+                logger=logger,
+                status=args.status,
+                output_format=args.format,
+            )
+            print(output)
+            return
+
+        parser.print_help()
+        sys.exit(1)
 
     except Exception as e:
         logger.error(str(e))

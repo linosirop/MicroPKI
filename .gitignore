@@ -40,3 +40,5 @@ secrets/
 # Local temp files
 *.tmp
 *.bak
+*.db
+micropki.db
