@@ -152,3 +152,38 @@ def apply_end_entity_template(builder, template: str, private_key, san_objects: 
         )
 
     return builder
+
+def apply_ocsp_template(builder, private_key, san_objects=None):
+        """Шаблон специально для OCSP Signing сертификата"""
+        builder = builder.add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([x509.ObjectIdentifier("1.3.6.1.5.5.7.3.9")]),  # id-kp-OCSPSigning
+            critical=False,
+        )
+
+        if san_objects:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName(san_objects),
+                critical=False,
+            )
+
+        return builder

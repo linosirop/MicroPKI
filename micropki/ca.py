@@ -353,3 +353,50 @@ def generate_crl_via_cli(
         logger=logger,
         out_file=out_file,
     )
+
+def issue_ocsp_responder_certificate(
+    ca_cert_path: str,
+    ca_key_path: str,
+    ca_pass_file: str,
+    subject: str,
+    san_entries: list[str] | None,
+    out_dir: str,
+    validity_days: int,
+    logger,
+    db_path: str | None = None,
+) -> None:
+    """Выпуск OCSP Signing сертификата"""
+    from micropki.ocsp import build_ocsp_responder_certificate
+    from micropki.crypto_utils import generate_private_key, serialize_unencrypted_private_key, save_private_key, save_certificate
+    from micropki.templates import parse_san_entries
+    from micropki.certificates import serialize_certificate
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    ca_cert = load_certificate_from_file(ca_cert_path)
+    ca_key = load_private_key_from_file(ca_key_path, read_passphrase_file(ca_pass_file))
+
+    san_objects = parse_san_entries(san_entries)
+    leaf_key = generate_private_key("rsa", 2048)
+
+    cert = build_ocsp_responder_certificate(
+        issuer_cert=ca_cert,
+        issuer_key=ca_key,
+        subject_dn=subject,
+        subject_public_key=leaf_key.public_key(),
+        validity_days=validity_days,
+        san_objects=san_objects,
+    )
+
+    cert_pem = serialize_certificate(cert).decode("utf-8")
+    common_name = certificate_common_name(cert).replace(" ", "_").replace(",", "")
+
+    cert_path = out_path / f"{common_name}.cert.pem"
+    key_path = out_path / f"{common_name}.key.pem"
+
+    save_private_key(key_path, serialize_unencrypted_private_key(leaf_key))
+    save_certificate(cert_path, cert_pem.encode("utf-8"))
+
+    logger.info(f"OCSP responder certificate issued: {cert_path}")
+    print(f"OCSP certificate and key saved to {out_path}")

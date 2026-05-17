@@ -9,6 +9,7 @@ from micropki.ca import (
     init_root_ca,
     issue_intermediate_ca,
     issue_end_entity_certificate,
+    issue_ocsp_responder_certificate,
     show_certificate_from_db,
     list_certificates_from_db,
     revoke_certificate_via_cli,
@@ -18,6 +19,7 @@ from micropki.logger import setup_logger
 from micropki.certificates import parse_subject_dn
 from micropki.database import init_database
 from micropki.repository import serve_repository
+from micropki.ocsp_responder import serve_ocsp
 from micropki.revocation import SUPPORTED_REVOCATION_REASONS
 
 
@@ -46,6 +48,16 @@ def validate_args(args: argparse.Namespace) -> None:
                 raise ValueError("--port must be between 1 and 65535")
         return
 
+    if args.command == "ocsp":
+        if args.ocsp_command == "serve":
+            validate_writable_directory(args.db_path)
+            for f in (args.responder_cert, args.responder_key, args.ca_cert):
+                if not Path(f).is_file():
+                    raise ValueError(f"File not found: {f}")
+            if args.port <= 0 or args.port > 65535:
+                raise ValueError("--port must be between 1 and 65535")
+        return
+
     if args.command != "ca":
         return
 
@@ -53,7 +65,6 @@ def validate_args(args: argparse.Namespace) -> None:
         if not args.subject or not args.subject.strip():
             raise ValueError("--subject must be a non-empty string")
         parse_subject_dn(args.subject)
-
         if args.key_type == "rsa" and args.key_size != 4096:
             raise ValueError("For RSA, --key-size must be 4096")
         if args.key_type == "ecc" and args.key_size != 384:
@@ -79,7 +90,7 @@ def validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(f"Missing required file: {file_arg}")
         validate_writable_directory(args.out_dir)
 
-    elif args.ca_command == "issue-cert":
+    elif args.ca_command in ("issue-cert", "issue-ocsp-cert"):
         parse_subject_dn(args.subject)
         if args.validity_days <= 0:
             raise ValueError("--validity-days must be positive")
@@ -118,12 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="micropki")
     subparsers = parser.add_subparsers(dest="command")
 
+    # db
     db_parser = subparsers.add_parser("db")
     db_subparsers = db_parser.add_subparsers(dest="db_command")
     db_init_parser = db_subparsers.add_parser("init")
     db_init_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     db_init_parser.add_argument("--log-file", default=None, type=str)
 
+    # repo
     repo_parser = subparsers.add_parser("repo")
     repo_subparsers = repo_parser.add_subparsers(dest="repo_command")
     repo_serve_parser = repo_subparsers.add_parser("serve")
@@ -133,6 +146,20 @@ def build_parser() -> argparse.ArgumentParser:
     repo_serve_parser.add_argument("--cert-dir", default="./pki/certs", type=str)
     repo_serve_parser.add_argument("--log-file", default=None, type=str)
 
+    # ocsp
+    ocsp_parser = subparsers.add_parser("ocsp")
+    ocsp_subparsers = ocsp_parser.add_subparsers(dest="ocsp_command")
+    ocsp_serve_parser = ocsp_subparsers.add_parser("serve")
+    ocsp_serve_parser.add_argument("--host", default="127.0.0.1", type=str)
+    ocsp_serve_parser.add_argument("--port", default=8081, type=int)
+    ocsp_serve_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    ocsp_serve_parser.add_argument("--responder-cert", required=True, type=str)
+    ocsp_serve_parser.add_argument("--responder-key", required=True, type=str)
+    ocsp_serve_parser.add_argument("--ca-cert", required=True, type=str)
+    ocsp_serve_parser.add_argument("--cache-ttl", default=60, type=int)
+    ocsp_serve_parser.add_argument("--log-file", default=None, type=str)
+
+    # ca
     ca_parser = subparsers.add_parser("ca")
     ca_subparsers = ca_parser.add_subparsers(dest="ca_command")
 
@@ -151,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     intermediate_parser.add_argument("--root-key", required=True, type=str)
     intermediate_parser.add_argument("--root-pass-file", required=True, type=str)
     intermediate_parser.add_argument("--subject", required=True, type=str)
-    intermediate_parser.add_argument("--key-type", choices=["rsa", "ecc"], required=True)
+    intermediate_parser.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
     intermediate_parser.add_argument("--key-size", type=int, required=True)
     intermediate_parser.add_argument("--passphrase-file", required=True, type=str)
     intermediate_parser.add_argument("--out-dir", default="./pki", type=str)
@@ -172,6 +199,21 @@ def build_parser() -> argparse.ArgumentParser:
     cert_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     cert_parser.add_argument("--log-file", default=None, type=str)
 
+    # Новый: issue-ocsp-cert
+    ocsp_cert_parser = ca_subparsers.add_parser("issue-ocsp-cert")
+    ocsp_cert_parser.add_argument("--ca-cert", required=True, type=str)
+    ocsp_cert_parser.add_argument("--ca-key", required=True, type=str)
+    ocsp_cert_parser.add_argument("--ca-pass-file", required=True, type=str)
+    ocsp_cert_parser.add_argument("--subject", required=True, type=str)
+    ocsp_cert_parser.add_argument("--san", action="append")
+    ocsp_cert_parser.add_argument("--out-dir", default="./pki/certs", type=str)
+    ocsp_cert_parser.add_argument("--validity-days", default=365, type=int)
+    ocsp_cert_parser.add_argument("--key-type", choices=["rsa"], default="rsa")
+    ocsp_cert_parser.add_argument("--key-size", type=int, default=2048)
+    ocsp_cert_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    ocsp_cert_parser.add_argument("--log-file", default=None, type=str)
+
+    # Остальные команды (show-cert, list-certs, revoke, gen-crl) — оставляем как было
     show_parser = ca_subparsers.add_parser("show-cert")
     show_parser.add_argument("serial", type=str)
     show_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
@@ -231,94 +273,114 @@ def main() -> None:
             )
             return
 
-        if args.command == "ca" and args.ca_command == "init":
-            init_root_ca(
-                subject=args.subject,
-                key_type=args.key_type,
-                key_size=args.key_size,
-                passphrase_file=args.passphrase_file,
-                out_dir=args.out_dir,
-                validity_days=args.validity_days,
-                logger=logger,
+        if args.command == "ocsp" and args.ocsp_command == "serve":
+            serve_ocsp(
+                host=args.host,
+                port=args.port,
                 db_path=args.db_path,
-            )
-            print("Root CA initialized successfully.")
-            return
-
-        if args.command == "ca" and args.ca_command == "issue-intermediate":
-            issue_intermediate_ca(
-                root_cert_path=args.root_cert,
-                root_key_path=args.root_key,
-                root_pass_file=args.root_pass_file,
-                subject=args.subject,
-                key_type=args.key_type,
-                key_size=args.key_size,
-                passphrase_file=args.passphrase_file,
-                out_dir=args.out_dir,
-                validity_days=args.validity_days,
-                pathlen=args.pathlen,
-                logger=logger,
-                db_path=args.db_path,
-            )
-            print("Intermediate CA issued successfully.")
-            return
-
-        if args.command == "ca" and args.ca_command == "issue-cert":
-            issue_end_entity_certificate(
-                ca_cert_path=args.ca_cert,
-                ca_key_path=args.ca_key,
-                ca_pass_file=args.ca_pass_file,
-                template=args.template,
-                subject=args.subject,
-                san_entries=args.san,
-                out_dir=args.out_dir,
-                validity_days=args.validity_days,
-                logger=logger,
-                db_path=args.db_path,
-            )
-            print("End-entity certificate issued successfully.")
-            return
-
-        if args.command == "ca" and args.ca_command == "show-cert":
-            pem = show_certificate_from_db(args.db_path, args.serial, logger)
-            print(pem, end="")
-            return
-
-        if args.command == "ca" and args.ca_command == "list-certs":
-            output = list_certificates_from_db(
-                db_path=args.db_path,
-                logger=logger,
-                status=args.status,
-                output_format=args.format,
-            )
-            print(output)
-            return
-
-        if args.command == "ca" and args.ca_command == "revoke":
-            result = revoke_certificate_via_cli(
-                db_path=args.db_path,
-                serial_hex=args.serial,
-                reason=args.reason,
+                responder_cert=args.responder_cert,
+                responder_key=args.responder_key,
+                ca_cert=args.ca_cert,
+                cache_ttl=args.cache_ttl,
                 logger=logger,
             )
-            if result["already_revoked"]:
-                print(f"Certificate {result['serial_hex']} is already revoked.")
-            else:
-                print(f"Certificate {result['serial_hex']} revoked successfully.")
             return
 
-        if args.command == "ca" and args.ca_command == "gen-crl":
-            result = generate_crl_via_cli(
-                db_path=args.db_path,
-                out_dir=args.out_dir,
-                ca=args.ca,
-                passphrase_file=args.passphrase_file,
-                next_update_days=args.next_update,
-                logger=logger,
-                out_file=args.out_file,
-            )
-            print(f"CRL generated successfully: {result['output_path']}")
-            return
+        # ==================== CA COMMANDS ====================
+        if args.command == "ca":
+            if args.ca_command == "init":
+                init_root_ca(
+                    subject=args.subject,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    passphrase_file=args.passphrase_file,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    logger=logger,
+                    db_path=args.db_path,
+                )
+                print("Root CA initialized successfully.")
+                return
+
+            elif args.ca_command == "issue-intermediate":
+                issue_intermediate_ca(
+                    root_cert_path=args.root_cert,
+                    root_key_path=args.root_key,
+                    root_pass_file=args.root_pass_file,
+                    subject=args.subject,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    passphrase_file=args.passphrase_file,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    pathlen=args.pathlen,
+                    logger=logger,
+                    db_path=args.db_path,
+                )
+                print("Intermediate CA issued successfully.")
+                return
+
+            elif args.ca_command == "issue-cert":
+                issue_end_entity_certificate(
+                    ca_cert_path=args.ca_cert,
+                    ca_key_path=args.ca_key,
+                    ca_pass_file=args.ca_pass_file,
+                    template=args.template,
+                    subject=args.subject,
+                    san_entries=args.san,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    logger=logger,
+                    db_path=args.db_path,
+                )
+                print("End-entity certificate issued successfully.")
+                return
+
+            elif args.ca_command == "issue-ocsp-cert":
+                issue_ocsp_responder_certificate(
+                    ca_cert_path=args.ca_cert,
+                    ca_key_path=args.ca_key,
+                    ca_pass_file=args.ca_pass_file,
+                    subject=args.subject,
+                    san_entries=args.san,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    logger=logger,
+                    db_path=args.db_path,
+                )
+                print("OCSP responder certificate issued successfully.")
+                return
+
+            # Остальные команды (show-cert, list-certs, revoke, gen-crl)
+            elif args.ca_command == "show-cert":
+                pem = show_certificate_from_db(args.db_path, args.serial, logger)
+                print(pem)
+                return
+
+            elif args.ca_command == "list-certs":
+                output = list_certificates_from_db(
+                    args.db_path, logger, args.status, args.format
+                )
+                print(output)
+                return
+
+            elif args.ca_command == "revoke":
+                revoke_certificate_via_cli(args.db_path, args.serial, args.reason, logger)
+                print(f"Certificate {args.serial} revoked successfully.")
+                return
+
+            elif args.ca_command == "gen-crl":
+                generate_crl_via_cli(
+                    db_path=args.db_path,
+                    out_dir=args.out_dir,
+                    ca=args.ca,
+                    passphrase_file=args.passphrase_file,
+                    next_update_days=args.next_update,
+                    logger=logger,
+                    out_file=args.out_file,
+                )
+                print("CRL generated successfully.")
+                return
 
         parser.print_help()
         sys.exit(1)
