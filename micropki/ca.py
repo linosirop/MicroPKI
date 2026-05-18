@@ -1,9 +1,11 @@
 from __future__ import annotations
-from cryptography import x509
-from cryptography.x509.oid import ExtensionOID
+
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID
 
 from micropki.crypto_utils import (
     read_passphrase_file,
@@ -32,6 +34,13 @@ from micropki.database import (
 )
 from micropki.revocation import revoke_certificate
 from micropki.crl import build_crl_for_ca
+from micropki.audit import audit_log, get_audit_logger
+from micropki.policy import (
+    validate_csr_policy, PolicyViolation,
+    check_key_size, check_validity_period, check_san_types
+)
+from micropki.transparency import CTLog
+from micropki.compromise import check_csr_public_key
 
 
 def ensure_output_directory(out_dir: Path, logger) -> None:
@@ -47,11 +56,11 @@ def ensure_output_directory(out_dir: Path, logger) -> None:
 
 
 def write_policy_file(
-    out_dir: Path,
-    subject_dn: str,
-    cert,
-    key_type: str,
-    key_size: int,
+        out_dir: Path,
+        subject_dn: str,
+        cert,
+        key_type: str,
+        key_size: int,
 ) -> None:
     policy_path = out_dir / "policy.txt"
     content = f"""MicroPKI Root CA Policy
@@ -69,13 +78,13 @@ Purpose: Root CA for MicroPKI demonstration
 
 
 def append_intermediate_policy(
-    out_dir: Path,
-    subject_dn: str,
-    cert,
-    key_type: str,
-    key_size: int,
-    pathlen: int,
-    issuer_dn: str,
+        out_dir: Path,
+        subject_dn: str,
+        cert,
+        key_type: str,
+        key_size: int,
+        pathlen: int,
+        issuer_dn: str,
 ) -> None:
     policy_path = out_dir / "policy.txt"
     content = f"""
@@ -112,7 +121,16 @@ def _store_certificate_in_db(cert, cert_pem: str, db_path: str, logger, subject_
     logger.info(f"Inserted certificate into DB: serial={serial_hex}, subject={subject}")
 
 
-def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days, logger, db_path: str | None = None) -> None:
+def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity_days, logger,
+                 db_path: str | None = None) -> None:
+    # Проверка политик
+    try:
+        check_key_size(key_type, key_size, "root")
+        check_validity_period(validity_days, "root")
+    except PolicyViolation as e:
+        audit_log("AUDIT", "ca_init", "failure", str(e), {"subject": subject})
+        raise ValueError(f"Policy violation: {e}")
+
     out_path = Path(out_dir)
     ensure_output_directory(out_path, logger)
 
@@ -148,21 +166,34 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir, validity
     write_policy_file(out_path, subject, cert, key_type, key_size)
     logger.info(f"Generated policy file at {(out_path / 'policy.txt').resolve()}")
 
+    # Аудит
+    audit_log("AUDIT", "ca_init", "success",
+              f"Root CA initialized: {subject}",
+              {"subject": subject, "key_type": key_type, "key_size": key_size})
+
 
 def issue_intermediate_ca(
-    root_cert_path: str,
-    root_key_path: str,
-    root_pass_file: str,
-    subject: str,
-    key_type: str,
-    key_size: int,
-    passphrase_file: str,
-    out_dir: str,
-    validity_days: int,
-    pathlen: int,
-    logger,
-    db_path: str | None = None,
+        root_cert_path: str,
+        root_key_path: str,
+        root_pass_file: str,
+        subject: str,
+        key_type: str,
+        key_size: int,
+        passphrase_file: str,
+        out_dir: str,
+        validity_days: int,
+        pathlen: int,
+        logger,
+        db_path: str | None = None,
 ) -> None:
+    # Проверка политик
+    try:
+        check_key_size(key_type, key_size, "intermediate")
+        check_validity_period(validity_days, "intermediate")
+    except PolicyViolation as e:
+        audit_log("AUDIT", "issue_intermediate", "failure", str(e), {"subject": subject})
+        raise ValueError(f"Policy violation: {e}")
+
     out_path = Path(out_dir)
     ensure_output_directory(out_path, logger)
 
@@ -224,6 +255,11 @@ def issue_intermediate_ca(
     )
     logger.info(f"Updated policy file at {(out_path / 'policy.txt').resolve()}")
 
+    # Аудит
+    audit_log("AUDIT", "issue_intermediate", "success",
+              f"Intermediate CA issued: {subject}",
+              {"subject": subject, "serial": f"{intermediate_cert.serial_number:x}"})
+
 
 def issue_end_entity_certificate(
         ca_cert_path: str,
@@ -236,7 +272,7 @@ def issue_end_entity_certificate(
         validity_days: int,
         logger,
         db_path: str | None = None,
-        csr_path: str | None = None,  # НОВЫЙ ПАРАМЕТР
+        csr_path: str | None = None,
 ) -> None:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -245,37 +281,72 @@ def issue_end_entity_certificate(
     ca_passphrase = read_passphrase_file(ca_pass_file)
     ca_key = load_private_key_from_file(ca_key_path, ca_passphrase)
 
-    # ===== ЛОГИКА CSR =====
-    if csr_path:
-        # Загружаем CSR
-        csr_data = Path(csr_path).read_bytes()
-        csr = x509.load_pem_x509_csr(csr_data)
+    san_objects = None
+    leaf_key = None
 
-        # Проверяем подпись CSR
-        if not csr.is_signature_valid:
-            raise ValueError("CSR signature is invalid")
+    # Проверка политик ДО операции
+    try:
+        # Проверка периода действия
+        check_validity_period(validity_days, "end_entity")
 
-        # Извлекаем public key и subject из CSR
-        leaf_key = csr.public_key()
-        subject = csr.subject.rfc4514_string()  # override subject из CSR
+        if csr_path:
+            # ===== ЛОГИКА С CSR =====
+            csr_data = Path(csr_path).read_bytes()
+            csr = x509.load_pem_x509_csr(csr_data)
 
-        # Извлекаем SAN из CSR, если есть
-        try:
-            san_ext = csr.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-            san_objects = list(san_ext.value)
-        except x509.ExtensionNotFound:
-            san_objects = parse_san_entries(san_entries) if san_entries else []
+            # Проверка на компрометацию ключа
+            if db_path and check_csr_public_key(db_path, csr_path):
+                audit_log("AUDIT", "issue_certificate", "failure",
+                          f"Rejected CSR with compromised public key",
+                          {"subject": subject, "csr": csr_path})
+                raise ValueError("Public key in CSR has been compromised")
 
-        logger.info(f"Using CSR: subject={subject}, SANs={san_objects}")
-    else:
-        # Старая логика: генерируем ключ сами
-        leaf_key_type = "rsa"
-        leaf_key_size = 2048
-        leaf_key = generate_private_key(leaf_key_type, leaf_key_size)
-        san_objects = parse_san_entries(san_entries)
+            # Проверяем подпись CSR
+            if not csr.is_signature_valid:
+                raise ValueError("CSR signature is invalid")
 
-    # ===== ДАЛЬШЕ СТАРАЯ ЛОГИКА =====
-    validate_template_and_sans(template, san_objects)
+            # Валидация CSR по политикам
+            validate_csr_policy(csr, template)
+
+            # Извлекаем public key и subject из CSR
+            leaf_key = csr.public_key()
+            subject = csr.subject.rfc4514_string()
+
+            # Извлекаем SAN из CSR
+            try:
+                san_ext = csr.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                san_objects = list(san_ext.value)
+            except x509.ExtensionNotFound:
+                san_objects = parse_san_entries(san_entries) if san_entries else []
+
+            # Проверяем размер ключа из CSR
+            from cryptography.hazmat.primitives.asymmetric import rsa, ec
+            if isinstance(leaf_key, rsa.RSAPublicKey):
+                check_key_size("rsa", leaf_key.key_size, "end_entity")
+            elif isinstance(leaf_key, ec.EllipticCurvePublicKey):
+                check_key_size("ecc", leaf_key.curve.key_size, "end_entity")
+
+            logger.info(f"Using CSR: subject={subject}, SANs={san_objects}")
+        else:
+            # ===== ГЕНЕРАЦИЯ НОВОГО КЛЮЧА =====
+            leaf_key_type = "rsa"
+            leaf_key_size = 2048
+
+            check_key_size(leaf_key_type, leaf_key_size, "end_entity")
+
+            leaf_key = generate_private_key(leaf_key_type, leaf_key_size)
+            san_objects = parse_san_entries(san_entries)
+
+        # Проверка типов SAN
+        if san_objects:
+            check_san_types(san_objects, template)
+
+        validate_template_and_sans(template, san_objects)
+
+    except PolicyViolation as e:
+        audit_log("AUDIT", "issue_certificate", "failure", str(e),
+                  {"subject": subject, "template": template})
+        raise ValueError(f"Policy violation: {e}")
 
     def template_builder(builder):
         return apply_end_entity_template(builder, template, leaf_key, san_objects)
@@ -284,7 +355,7 @@ def issue_end_entity_certificate(
         issuer_cert=ca_cert,
         issuer_key=ca_key,
         subject_dn=subject,
-        subject_public_key=leaf_key.public_key() if csr_path else leaf_key.public_key(),
+        subject_public_key=leaf_key.public_key(),
         validity_days=validity_days,
         template_builder=template_builder,
     )
@@ -294,14 +365,19 @@ def issue_end_entity_certificate(
     if db_path:
         _store_certificate_in_db(cert, cert_pem, db_path, logger, subject)
 
+        # Добавляем в CT лог
+        ct_log = CTLog(Path(out_dir).parent / "audit")
+        ct_log.add_entry(f"{cert.serial_number:x}", subject, cert_pem)
+
     common_name = certificate_common_name(cert).replace(" ", "_")
     cert_path = out_path / f"{common_name}.cert.pem"
     key_path = out_path / f"{common_name}.key.pem"
 
-    permissions_ok = save_private_key(key_path, serialize_unencrypted_private_key(leaf_key))
-    logger.warning("End-entity private key is stored unencrypted.")
-    if not permissions_ok:
-        logger.warning("Could not enforce 0o600 permissions on end-entity private key file on this OS.")
+    if not csr_path:
+        permissions_ok = save_private_key(key_path, serialize_unencrypted_private_key(leaf_key))
+        logger.warning("End-entity private key is stored unencrypted.")
+        if not permissions_ok:
+            logger.warning("Could not enforce 0o600 permissions on end-entity private key file on this OS.")
 
     save_certificate(cert_path, cert_pem.encode("utf-8"))
 
@@ -309,8 +385,12 @@ def issue_end_entity_certificate(
         f"Successful issuance of end-entity certificate: template={template}, "
         f"subject={subject}, sans={san_entries or []}, serial={cert.serial_number:x}"
     )
-    logger.info(f"Saved end-entity key to {key_path.resolve()}")
     logger.info(f"Saved end-entity certificate to {cert_path.resolve()}")
+
+    # Аудит успеха
+    audit_log("AUDIT", "issue_certificate", "success",
+              f"Issued {template} certificate for {subject}",
+              {"serial": f"{cert.serial_number:x}", "subject": subject, "template": template})
 
 
 def show_certificate_from_db(db_path: str, serial_hex: str, logger) -> str:
@@ -323,10 +403,10 @@ def show_certificate_from_db(db_path: str, serial_hex: str, logger) -> str:
 
 
 def list_certificates_from_db(
-    db_path: str,
-    logger,
-    status: str | None = None,
-    output_format: str = "table",
+        db_path: str,
+        logger,
+        status: str | None = None,
+        output_format: str = "table",
 ) -> str:
     rows = list_certificates(db_path, status=status)
 
@@ -358,20 +438,39 @@ def list_certificates_from_db(
 
 
 def revoke_certificate_via_cli(db_path: str, serial_hex: str, reason: str, logger):
-    return revoke_certificate(db_path, serial_hex, reason, logger)
+    result = revoke_certificate(db_path, serial_hex, reason, logger)
+
+    # Аудит
+    audit_log("AUDIT", "revoke_certificate", "success",
+              f"Certificate {serial_hex} revoked with reason {reason}",
+              {"serial": serial_hex, "reason": reason})
+
+    # Пытаемся сгенерировать CRL
+    try:
+        out_dir = Path("./pki")
+        for ca_type in ["root", "intermediate"]:
+            try:
+                build_crl_for_ca(db_path, str(out_dir), ca_type,
+                                 str(out_dir / "passphrase.txt"), 7, logger)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Could not auto-generate CRL: {e}")
+
+    return result
 
 
 def generate_crl_via_cli(
-    db_path: str,
-    out_dir: str,
-    ca: str,
-    passphrase_file: str,
-    next_update_days: int,
-    logger,
-    out_file: str | None = None,
+        db_path: str,
+        out_dir: str,
+        ca: str,
+        passphrase_file: str,
+        next_update_days: int,
+        logger,
+        out_file: str | None = None,
 ):
     logger.info(f"Starting CRL generation for CA={ca}")
-    return build_crl_for_ca(
+    result = build_crl_for_ca(
         db_path=db_path,
         out_dir=out_dir,
         ca=ca,
@@ -381,20 +480,29 @@ def generate_crl_via_cli(
         out_file=out_file,
     )
 
+    # Аудит
+    audit_log("AUDIT", "generate_crl", "success",
+              f"CRL generated for {ca} CA",
+              {"ca": ca, "crl_number": result.get("crl_number"), "revoked_count": result.get("revoked_count")})
+
+    return result
+
+
 def issue_ocsp_responder_certificate(
-    ca_cert_path: str,
-    ca_key_path: str,
-    ca_pass_file: str,
-    subject: str,
-    san_entries: list[str] | None,
-    out_dir: str,
-    validity_days: int,
-    logger,
-    db_path: str | None = None,
+        ca_cert_path: str,
+        ca_key_path: str,
+        ca_pass_file: str,
+        subject: str,
+        san_entries: list[str] | None,
+        out_dir: str,
+        validity_days: int,
+        logger,
+        db_path: str | None = None,
 ) -> None:
     """Выпуск OCSP Signing сертификата"""
     from micropki.ocsp import build_ocsp_responder_certificate
-    from micropki.crypto_utils import generate_private_key, serialize_unencrypted_private_key, save_private_key, save_certificate
+    from micropki.crypto_utils import generate_private_key, serialize_unencrypted_private_key, save_private_key, \
+        save_certificate
     from micropki.templates import parse_san_entries
     from micropki.certificates import serialize_certificate
 
@@ -427,3 +535,8 @@ def issue_ocsp_responder_certificate(
 
     logger.info(f"OCSP responder certificate issued: {cert_path}")
     print(f"OCSP certificate and key saved to {out_path}")
+
+    # Аудит
+    audit_log("AUDIT", "issue_ocsp_certificate", "success",
+              f"OCSP responder certificate issued for {subject}",
+              {"subject": subject})

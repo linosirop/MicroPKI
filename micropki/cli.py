@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,7 +22,10 @@ from micropki.database import init_database
 from micropki.repository import serve_repository
 from micropki.ocsp_responder import serve_ocsp
 from micropki.revocation import SUPPORTED_REVOCATION_REASONS
-
+from micropki.audit import init_audit_logger, get_audit_logger
+from micropki.policy import MAX_VALIDITY, MIN_KEY_SIZE
+from micropki.transparency import CTLog
+from micropki.compromise import mark_key_compromised, get_public_key_hash
 
 DEFAULT_DB_PATH = "./pki/micropki.db"
 
@@ -124,6 +128,18 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--passphrase-file must exist and be readable")
         validate_writable_directory(args.out_dir)
 
+    elif args.ca_command == "audit-query":
+        if args.format not in {"table", "json", "csv"}:
+            raise ValueError("--format must be one of: table, json, csv")
+
+    elif args.ca_command == "compromise":
+        if not Path(args.cert).is_file():
+            raise ValueError(f"Certificate file not found: {args.cert}")
+
+    elif args.ca_command == "ct-verify":
+        if not args.serial:
+            raise ValueError("Serial must be provided")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="micropki")
@@ -145,6 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
     repo_serve_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     repo_serve_parser.add_argument("--cert-dir", default="./pki/certs", type=str)
     repo_serve_parser.add_argument("--log-file", default=None, type=str)
+    repo_serve_parser.add_argument("--rate-limit", default=0, type=float,
+                                   help="Requests per second per client IP (0 = disabled)")
+    repo_serve_parser.add_argument("--rate-burst", default=10, type=int,
+                                   help="Burst allowance")
 
     # ocsp
     ocsp_parser = subparsers.add_parser("ocsp")
@@ -198,8 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
     cert_parser.add_argument("--validity-days", default=365, type=int)
     cert_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     cert_parser.add_argument("--log-file", default=None, type=str)
+    cert_parser.add_argument("--csr", default=None, type=str, help="CSR file to use instead of generating new key")
 
-    # Новый: issue-ocsp-cert
     ocsp_cert_parser = ca_subparsers.add_parser("issue-ocsp-cert")
     ocsp_cert_parser.add_argument("--ca-cert", required=True, type=str)
     ocsp_cert_parser.add_argument("--ca-key", required=True, type=str)
@@ -213,7 +233,6 @@ def build_parser() -> argparse.ArgumentParser:
     ocsp_cert_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     ocsp_cert_parser.add_argument("--log-file", default=None, type=str)
 
-    # Остальные команды (show-cert, list-certs, revoke, gen-crl) — оставляем как было
     show_parser = ca_subparsers.add_parser("show-cert")
     show_parser.add_argument("serial", type=str)
     show_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
@@ -241,14 +260,39 @@ def build_parser() -> argparse.ArgumentParser:
     gen_crl_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     gen_crl_parser.add_argument("--log-file", default=None, type=str)
 
-    # В ca issue-cert добавить --csr
-    cert_parser.add_argument("--csr", default=None, type=str, help="CSR file to use instead of generating new key")
+    # НОВЫЕ КОМАНДЫ ДЛЯ SPRINT 7
+    audit_query_parser = ca_subparsers.add_parser("audit-query")
+    audit_query_parser.add_argument("--from", dest="from_time", default=None, type=str)
+    audit_query_parser.add_argument("--to", dest="to_time", default=None, type=str)
+    audit_query_parser.add_argument("--level", default=None, type=str, choices=["INFO", "WARNING", "ERROR", "AUDIT"])
+    audit_query_parser.add_argument("--operation", default=None, type=str)
+    audit_query_parser.add_argument("--serial", default=None, type=str)
+    audit_query_parser.add_argument("--format", choices=["table", "json", "csv"], default="table")
+    audit_query_parser.add_argument("--verify", action="store_true")
+    audit_query_parser.add_argument("--log-file", default="./pki/audit/audit.log", type=str)
+    audit_query_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
 
-    # Добавить группу client команд
+    audit_verify_parser = ca_subparsers.add_parser("audit-verify")
+    audit_verify_parser.add_argument("--log-file", default="./pki/audit/audit.log", type=str)
+    audit_verify_parser.add_argument("--chain-file", default="./pki/audit/chain.dat", type=str)
+    audit_verify_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+
+    compromise_parser = ca_subparsers.add_parser("compromise")
+    compromise_parser.add_argument("--cert", required=True, type=str)
+    compromise_parser.add_argument("--reason", default="keyCompromise", type=str)
+    compromise_parser.add_argument("--force", action="store_true")
+    compromise_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+    compromise_parser.add_argument("--log-file", default=None, type=str)
+
+    ct_verify_parser = ca_subparsers.add_parser("ct-verify")
+    ct_verify_parser.add_argument("--serial", required=True, type=str)
+    ct_verify_parser.add_argument("--ct-log", default="./pki/audit/ct.log", type=str)
+    ct_verify_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
+
+    # client commands
     client_parser = subparsers.add_parser("client")
     client_subparsers = client_parser.add_subparsers(dest="client_command")
 
-    # gen-csr
     gen_csr_parser = client_subparsers.add_parser("gen-csr")
     gen_csr_parser.add_argument("--subject", required=True, type=str)
     gen_csr_parser.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
@@ -258,7 +302,6 @@ def build_parser() -> argparse.ArgumentParser:
     gen_csr_parser.add_argument("--out-csr", default="./request.csr.pem", type=str)
     gen_csr_parser.add_argument("--log-file", default=None, type=str)
 
-    # request-cert
     request_parser = client_subparsers.add_parser("request-cert")
     request_parser.add_argument("--csr", required=True, type=str)
     request_parser.add_argument("--template", choices=["server", "client", "code_signing"], required=True)
@@ -267,7 +310,6 @@ def build_parser() -> argparse.ArgumentParser:
     request_parser.add_argument("--api-key", default=None, type=str)
     request_parser.add_argument("--log-file", default=None, type=str)
 
-    # validate
     validate_parser = client_subparsers.add_parser("validate")
     validate_parser.add_argument("--cert", required=True, type=str)
     validate_parser.add_argument("--untrusted", action="append", default=[])
@@ -277,7 +319,6 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--format", choices=["table", "json"], default="table")
     validate_parser.add_argument("--log-file", default=None, type=str)
 
-    # check-status
     check_parser = client_subparsers.add_parser("check-status")
     check_parser.add_argument("--cert", required=True, type=str)
     check_parser.add_argument("--ca-cert", required=True, type=str)
@@ -299,11 +340,9 @@ def main() -> None:
 
     logger = setup_logger(getattr(args, "log_file", None))
 
-    if args.command == "client":
-        if hasattr(args, "log_file") and args.log_file:
-            logger = setup_logger(args.log_file)
-        else:
-            logger = setup_logger(None)
+    # Инициализация аудит логгера
+    audit_dir = Path("./pki/audit")
+    init_audit_logger(audit_dir, logger)
 
     try:
         validate_args(args)
@@ -321,6 +360,8 @@ def main() -> None:
                 db_path=args.db_path,
                 cert_dir=args.cert_dir,
                 logger=logger,
+                rate_limit=getattr(args, 'rate_limit', 0),
+                rate_burst=getattr(args, 'rate_burst', 10),
             )
             return
 
@@ -383,29 +424,10 @@ def main() -> None:
                     validity_days=args.validity_days,
                     logger=logger,
                     db_path=args.db_path,
-                )
-
-
-                print("End-entity certificate issued successfully.")
-                return
-
-            elif args.ca_command == "issue-cert":
-                issue_end_entity_certificate(
-                    ca_cert_path=args.ca_cert,
-                    ca_key_path=args.ca_key,
-                    ca_pass_file=args.ca_pass_file,
-                    template=args.template,
-                    subject=args.subject,
-                    san_entries=args.san,
-                    out_dir=args.out_dir,
-                    validity_days=args.validity_days,
-                    logger=logger,
-                    db_path=args.db_path,
-                    csr_path=args.csr,  # НОВЫЙ ПАРАМЕТР
+                    csr_path=args.csr,
                 )
                 print("End-entity certificate issued successfully.")
                 return
-
 
             elif args.ca_command == "issue-ocsp-cert":
                 issue_ocsp_responder_certificate(
@@ -422,16 +444,13 @@ def main() -> None:
                 print("OCSP responder certificate issued successfully.")
                 return
 
-            # Остальные команды (show-cert, list-certs, revoke, gen-crl)
             elif args.ca_command == "show-cert":
                 pem = show_certificate_from_db(args.db_path, args.serial, logger)
                 print(pem)
                 return
 
             elif args.ca_command == "list-certs":
-                output = list_certificates_from_db(
-                    args.db_path, logger, args.status, args.format
-                )
+                output = list_certificates_from_db(args.db_path, logger, args.status, args.format)
                 print(output)
                 return
 
@@ -453,6 +472,156 @@ def main() -> None:
                 print("CRL generated successfully.")
                 return
 
+            # НОВЫЕ КОМАНДЫ SPRINT 7
+            elif args.ca_command == "audit-query":
+                audit_logger = get_audit_logger()
+                entries = audit_logger.query_logs(
+                    from_time=getattr(args, 'from_time', None),
+                    to_time=getattr(args, 'to_time', None),
+                    level=args.level,
+                    operation=args.operation,
+                    serial=args.serial
+                )
+
+                if args.format == "json":
+                    print(json.dumps(entries, indent=2, ensure_ascii=False))
+                elif args.format == "csv":
+                    import csv
+                    if entries:
+                        writer = csv.DictWriter(sys.stdout, fieldnames=entries[0].keys())
+                        writer.writeheader()
+                        writer.writerows(entries)
+                else:
+                    print(f"\n{'=' * 80}")
+                    print("AUDIT LOG QUERY RESULTS")
+                    print(f"{'=' * 80}")
+                    if not entries:
+                        print("No entries found matching the criteria.")
+                    for entry in entries:
+                        print(f"[{entry['timestamp']}] {entry['level']}")
+                        print(f"  Operation: {entry['operation']} ({entry['status']})")
+                        print(f"  Message: {entry['message']}")
+                        if entry.get('metadata'):
+                            print(f"  Metadata: {entry['metadata']}")
+                        print()
+
+                if args.verify:
+                    is_valid, line, error = audit_logger.verify_integrity()
+                    if is_valid:
+                        print("✅ Audit log integrity verified")
+                    else:
+                        print(f"❌ Audit log tampered! {error}")
+                        sys.exit(1)
+                return
+
+            elif args.ca_command == "audit-verify":
+                audit_logger = get_audit_logger()
+                is_valid, line, error = audit_logger.verify_integrity()
+                if is_valid:
+                    print("✅ Audit log integrity verified")
+                else:
+                    print(f"❌ Audit log integrity check FAILED!")
+                    print(f"   Error: {error}")
+                    sys.exit(1)
+                return
+
+            elif args.ca_command == "compromise":
+                print(f"⚠️  SIMULATING PRIVATE KEY COMPROMISE")
+                print(f"   Certificate: {args.cert}")
+                print(f"   Reason: {args.reason}")
+
+                if not args.force:
+                    confirm = input("Are you sure you want to mark this key as compromised? (yes/no): ")
+                    if confirm.lower() != "yes":
+                        print("Aborted.")
+                        return
+
+                from cryptography import x509
+                with open(args.cert, "rb") as f:
+                    cert = x509.load_pem_x509_certificate(f.read())
+                serial_hex = f"{cert.serial_number:x}".upper()
+
+                revoke_certificate_via_cli(args.db_path, serial_hex, args.reason, logger)
+                mark_key_compromised(args.db_path, args.cert, args.reason, logger)
+
+                generate_crl_via_cli(
+                    db_path=args.db_path,
+                    out_dir="./pki",
+                    ca="intermediate",
+                    passphrase_file="./pki/passphrase.txt",
+                    next_update_days=7,
+                    logger=logger,
+                )
+
+                print(f"\n✅ Certificate {serial_hex} has been revoked due to key compromise")
+                print(f"   The public key hash has been added to the compromised keys database")
+                print(f"   Any future CSR using this key will be rejected")
+                return
+
+            elif args.ca_command == "ct-verify":
+                ct_log = CTLog(Path(args.ct_log).parent)
+                found = ct_log.verify_inclusion(args.serial)
+                if found:
+                    print(f"✅ Certificate with serial {args.serial} found in CT log")
+                else:
+                    print(f"❌ Certificate with serial {args.serial} NOT found in CT log")
+                    print(f"   Checked log: {args.ct_log}")
+                    sys.exit(1)
+                return
+
+        # ==================== CLIENT COMMANDS ====================
+        if args.command == "client":
+            from micropki.client import generate_csr, request_certificate, validate_certificate, check_status
+
+            if args.client_command == "gen-csr":
+                generate_csr(
+                    subject=args.subject,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    san_entries=args.san,
+                    out_key_path=args.out_key,
+                    out_csr_path=args.out_csr,
+                    logger=logger,
+                )
+                print(f"✅ CSR generated successfully")
+                print(f"   Private key: {args.out_key}")
+                print(f"   CSR: {args.out_csr}")
+                return
+
+            elif args.client_command == "request-cert":
+                request_certificate(
+                    csr_path=args.csr,
+                    template=args.template,
+                    ca_url=args.ca_url,
+                    out_cert_path=args.out_cert,
+                    api_key=args.api_key,
+                    logger=logger,
+                )
+                return
+
+            elif args.client_command == "validate":
+                validate_certificate(
+                    cert_path=args.cert,
+                    untrusted_paths=args.untrusted,
+                    trusted_paths=args.trusted,
+                    validation_time=args.validation_time,
+                    expected_eku=args.eku,
+                    output_format=args.format,
+                    logger=logger,
+                )
+                return
+
+            elif args.client_command == "check-status":
+                check_status(
+                    cert_path=args.cert,
+                    ca_cert_path=args.ca_cert,
+                    crl_source=args.crl,
+                    ocsp_url=args.ocsp_url,
+                    prefer_ocsp=args.prefer_ocsp,
+                    logger=logger,
+                )
+                return
+
         parser.print_help()
         sys.exit(1)
 
@@ -460,3 +629,7 @@ def main() -> None:
         logger.error(str(e))
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
