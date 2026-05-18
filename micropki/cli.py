@@ -241,6 +241,51 @@ def build_parser() -> argparse.ArgumentParser:
     gen_crl_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, type=str)
     gen_crl_parser.add_argument("--log-file", default=None, type=str)
 
+    # В ca issue-cert добавить --csr
+    cert_parser.add_argument("--csr", default=None, type=str, help="CSR file to use instead of generating new key")
+
+    # Добавить группу client команд
+    client_parser = subparsers.add_parser("client")
+    client_subparsers = client_parser.add_subparsers(dest="client_command")
+
+    # gen-csr
+    gen_csr_parser = client_subparsers.add_parser("gen-csr")
+    gen_csr_parser.add_argument("--subject", required=True, type=str)
+    gen_csr_parser.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
+    gen_csr_parser.add_argument("--key-size", type=int, default=2048)
+    gen_csr_parser.add_argument("--san", action="append")
+    gen_csr_parser.add_argument("--out-key", default="./key.pem", type=str)
+    gen_csr_parser.add_argument("--out-csr", default="./request.csr.pem", type=str)
+    gen_csr_parser.add_argument("--log-file", default=None, type=str)
+
+    # request-cert
+    request_parser = client_subparsers.add_parser("request-cert")
+    request_parser.add_argument("--csr", required=True, type=str)
+    request_parser.add_argument("--template", choices=["server", "client", "code_signing"], required=True)
+    request_parser.add_argument("--ca-url", required=True, type=str)
+    request_parser.add_argument("--out-cert", default="./cert.pem", type=str)
+    request_parser.add_argument("--api-key", default=None, type=str)
+    request_parser.add_argument("--log-file", default=None, type=str)
+
+    # validate
+    validate_parser = client_subparsers.add_parser("validate")
+    validate_parser.add_argument("--cert", required=True, type=str)
+    validate_parser.add_argument("--untrusted", action="append", default=[])
+    validate_parser.add_argument("--trusted", action="append", default=["./pki/certs/ca.cert.pem"])
+    validate_parser.add_argument("--validation-time", default=None, type=str)
+    validate_parser.add_argument("--eku", choices=["server", "client", "code_signing"], default=None)
+    validate_parser.add_argument("--format", choices=["table", "json"], default="table")
+    validate_parser.add_argument("--log-file", default=None, type=str)
+
+    # check-status
+    check_parser = client_subparsers.add_parser("check-status")
+    check_parser.add_argument("--cert", required=True, type=str)
+    check_parser.add_argument("--ca-cert", required=True, type=str)
+    check_parser.add_argument("--crl", default=None, type=str)
+    check_parser.add_argument("--ocsp-url", default=None, type=str)
+    check_parser.add_argument("--prefer-ocsp", action="store_true", default=True)
+    check_parser.add_argument("--log-file", default=None, type=str)
+
     return parser
 
 
@@ -253,6 +298,12 @@ def main() -> None:
         sys.exit(1)
 
     logger = setup_logger(getattr(args, "log_file", None))
+
+    if args.command == "client":
+        if hasattr(args, "log_file") and args.log_file:
+            logger = setup_logger(args.log_file)
+        else:
+            logger = setup_logger(None)
 
     try:
         validate_args(args)
@@ -333,8 +384,28 @@ def main() -> None:
                     logger=logger,
                     db_path=args.db_path,
                 )
+
+
                 print("End-entity certificate issued successfully.")
                 return
+
+            elif args.ca_command == "issue-cert":
+                issue_end_entity_certificate(
+                    ca_cert_path=args.ca_cert,
+                    ca_key_path=args.ca_key,
+                    ca_pass_file=args.ca_pass_file,
+                    template=args.template,
+                    subject=args.subject,
+                    san_entries=args.san,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    logger=logger,
+                    db_path=args.db_path,
+                    csr_path=args.csr,  # НОВЫЙ ПАРАМЕТР
+                )
+                print("End-entity certificate issued successfully.")
+                return
+
 
             elif args.ca_command == "issue-ocsp-cert":
                 issue_ocsp_responder_certificate(

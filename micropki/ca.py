@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID
 import json
 from pathlib import Path
 from datetime import datetime, timezone
@@ -225,16 +226,17 @@ def issue_intermediate_ca(
 
 
 def issue_end_entity_certificate(
-    ca_cert_path: str,
-    ca_key_path: str,
-    ca_pass_file: str,
-    template: str,
-    subject: str,
-    san_entries: list[str] | None,
-    out_dir: str,
-    validity_days: int,
-    logger,
-    db_path: str | None = None,
+        ca_cert_path: str,
+        ca_key_path: str,
+        ca_pass_file: str,
+        template: str,
+        subject: str,
+        san_entries: list[str] | None,
+        out_dir: str,
+        validity_days: int,
+        logger,
+        db_path: str | None = None,
+        csr_path: str | None = None,  # НОВЫЙ ПАРАМЕТР
 ) -> None:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -243,12 +245,37 @@ def issue_end_entity_certificate(
     ca_passphrase = read_passphrase_file(ca_pass_file)
     ca_key = load_private_key_from_file(ca_key_path, ca_passphrase)
 
-    san_objects = parse_san_entries(san_entries)
-    validate_template_and_sans(template, san_objects)
+    # ===== ЛОГИКА CSR =====
+    if csr_path:
+        # Загружаем CSR
+        csr_data = Path(csr_path).read_bytes()
+        csr = x509.load_pem_x509_csr(csr_data)
 
-    leaf_key_type = "rsa"
-    leaf_key_size = 2048
-    leaf_key = generate_private_key(leaf_key_type, leaf_key_size)
+        # Проверяем подпись CSR
+        if not csr.is_signature_valid:
+            raise ValueError("CSR signature is invalid")
+
+        # Извлекаем public key и subject из CSR
+        leaf_key = csr.public_key()
+        subject = csr.subject.rfc4514_string()  # override subject из CSR
+
+        # Извлекаем SAN из CSR, если есть
+        try:
+            san_ext = csr.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            san_objects = list(san_ext.value)
+        except x509.ExtensionNotFound:
+            san_objects = parse_san_entries(san_entries) if san_entries else []
+
+        logger.info(f"Using CSR: subject={subject}, SANs={san_objects}")
+    else:
+        # Старая логика: генерируем ключ сами
+        leaf_key_type = "rsa"
+        leaf_key_size = 2048
+        leaf_key = generate_private_key(leaf_key_type, leaf_key_size)
+        san_objects = parse_san_entries(san_entries)
+
+    # ===== ДАЛЬШЕ СТАРАЯ ЛОГИКА =====
+    validate_template_and_sans(template, san_objects)
 
     def template_builder(builder):
         return apply_end_entity_template(builder, template, leaf_key, san_objects)
@@ -257,7 +284,7 @@ def issue_end_entity_certificate(
         issuer_cert=ca_cert,
         issuer_key=ca_key,
         subject_dn=subject,
-        subject_public_key=leaf_key.public_key(),
+        subject_public_key=leaf_key.public_key() if csr_path else leaf_key.public_key(),
         validity_days=validity_days,
         template_builder=template_builder,
     )
